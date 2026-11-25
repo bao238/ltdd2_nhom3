@@ -254,6 +254,7 @@ void dangKyTheMaster(String uid) {
   luuTheMaster(uid);
   coiDangKy();
   hienThi("THE MASTER MOI", "UID:" + uid);
+  delay(1200); // Giữ thông báo Đăng ký Master mới trên LCD đủ lâu cho người dùng nhìn rõ
   moCua("Dang ky the Master", true); // Tự động mở cửa ngay khi đăng ký Master thành công!
 }
 
@@ -273,6 +274,21 @@ void tuChoiThe(String uid) {
 }
 
 void kiemTraRFID() {
+  // =========================================================================
+  // CƠ CHẾ AUTO-HEALING: TỰ ĐỘNG BẬT LẠI ANTEN NẾU BỊ SỤT ÁP DO PHÁT WIFI FIREBASE
+  // =========================================================================
+  static unsigned long thoiGianKiemTraAnten = 0;
+  if (millis() - thoiGianKiemTraAnten >= 3000) {
+    thoiGianKiemTraAnten = millis();
+    byte tx = rfid.PCD_ReadRegister(rfid.TxControlReg);
+    // Nếu Anten bị tắt (không đủ bit 0x03) hoặc mất tín hiệu kết nối SPI
+    if ((tx & 0x03) != 0x03) {
+      rfid.PCD_Init();                           // Tái khởi tạo chip RC522
+      rfid.PCD_SetAntennaGain(rfid.RxGain_max); // Kích công suất Anten cực đại 48dB
+      rfid.PCD_AntennaOn();                     // Bật lại Anten phát sóng ngay lập tức
+    }
+  }
+
   if (!rfid.PICC_IsNewCardPresent()) return;
   if (!rfid.PICC_ReadCardSerial()) return;
 
@@ -331,7 +347,7 @@ void kiemTraNutBoot() {
     unsigned long tBatDau = millis();
     while (digitalRead(BTN_BOOT) == LOW) {
       if (millis() - tBatDau >= 1500) {
-        // Nhấn giữ nút BOOT 1.5 giây -> Xóa Master khỏi bộ nhớ Flash
+        // 1. Nhấn giữ nút BOOT 1.5 giây -> Xóa Master khỏi bộ nhớ Flash
         boNho.begin("SmartLock", false);
         boNho.remove("masterUID");
         boNho.end();
@@ -339,7 +355,19 @@ void kiemTraNutBoot() {
         Serial.println("[RESET] Da xoa the Master! Hay quet the bat ky de hoc lam the Master moi.");
         hienThi("DA XOA MASTER", "QUET DE HOC THE");
         coiDangKy();
-        delay(1500);
+
+        // 2. Chống kẹt nút: Chờ người dùng thả hẳn tay ra khỏi nút BOOT
+        while (digitalRead(BTN_BOOT) == LOW) {
+          delay(10);
+        }
+
+        // 3. Tự động kích hoạt lại Anten RC522 công suất tối đa ngay sau khi reset
+        rfid.PCD_Init();
+        rfid.PCD_SetAntennaGain(rfid.RxGain_max);
+        rfid.PCD_AntennaOn();
+        Serial.println("[RFID] Da kich hoat lai Anten RC522 sau khi reset!");
+
+        delay(300);
         break;
       }
       delay(20);
