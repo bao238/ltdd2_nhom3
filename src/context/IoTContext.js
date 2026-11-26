@@ -265,6 +265,10 @@ export const IoTProvider = ({ children }) => {
               } else if (s.type === SENSOR_TYPES.HUMIDITY && data.hum !== undefined) {
                 val = Number(data.hum);
                 status = val >= s.dangerThreshold ? 'Quá ẩm' : val >= s.warningThreshold ? 'Khá ẩm' : 'Thoải mái';
+              } else if ((s.type === SENSOR_TYPES.FLAME || s.id === 'sensor_flame') && (data.flame !== undefined || data.flame_val !== undefined)) {
+                val = Number(data.flame_val !== undefined ? data.flame_val : (data.flame ? 2500 : 0));
+                const isFire = Boolean(data.flame);
+                status = isFire ? 'Phát hiện LỬA!' : 'An toàn';
               }
 
               // Chỉ cập nhật object khi giá trị hoặc trạng thái thực sự thay đổi
@@ -280,7 +284,7 @@ export const IoTProvider = ({ children }) => {
                   history: updatedHistory,
                 };
 
-                if (val >= s.dangerThreshold) {
+                if (val >= s.dangerThreshold || (Boolean(data.flame) && (s.type === SENSOR_TYPES.FLAME || s.id === 'sensor_flame'))) {
                   checkAndPushAlert(updatedSensor, 'danger');
                 }
 

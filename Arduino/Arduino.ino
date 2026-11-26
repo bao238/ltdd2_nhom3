@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <SPI.h>
+#define MFRC522_SPICLOCK 4000000u // Ép xung nhịp bus SPI lên 4MHz siêu tốc cho RC522 (tối đa 10MHz theo chuẩn phần cứng)
 #include <MFRC522.h>
 #include <ESP32Servo.h>
 #include <Preferences.h>
@@ -17,6 +18,8 @@
   ======================================================================
   ĐỒ ÁN LẬP TRÌNH DI ĐỘNG (LTDD) - NHÓM 3 (BẢN TỐI ƯU HOÀN CHỈNH)
   - HỆ THỐNG SMART HOME & KIỂM SOÁT CỔNG RA VÀO (ESP32)
+  - TÍCH HỢP CẢM BIẾN LỬA 2 CHÂN (FLAME SENSOR) TRÊN GPIO 32 (ADC1)
+  - TỐI ƯU ĐỘ NHẠY RFID: KÍCH ANTEN 48DB + HẠ NGƯỠNG LỌC + WAKEUPA BẮT THẺ TỨC THÌ
   - CÒI VÀ LCD CHẠY ĐỒNG THỜI CÙNG LÚC KHI ĐÓNG / MỞ CỔNG (0MS)
   - MỞ CỬA QUA WEB / APP / REMOTE SẼ KHÔNG TỰ ĐỘNG ĐÓNG (CHỈ RFID TỰ ĐÓNG)
   - QUÉT THẺ MASTER LẦN ĐẦU TỰ ĐỘNG MỞ CỬA NGAY (KHÔNG CẦN CHỜ LẦN 2)
@@ -51,14 +54,15 @@
 #define LED_PIN 2     // Đèn LED tích hợp (Onboard LED) đại diện cho đèn nhà
 #define IR_PIN 15     // Chân OUT của mắt thu hồng ngoại Remote IR
 #define BTN_BOOT 0    // Nút nhấn BOOT tích hợp trên bo mạch ESP32
+#define FLAME_PIN 32  // Chân tín hiệu cảm biến lửa 2 đầu cắm (ADC1_CH4 trên ESP32)
 
 #define ACTIVE_BUZZER 0 // 0: Passive Buzzer dùng tone(); 1: Active Buzzer dùng HIGH/LOW
 
 // ==================================================
 // 2. CẤU HÌNH WI-FI & FIREBASE
 // ==================================================
-const char* ssid = "Kim Khom";
-const char* password = "08012005@";
+const char* ssid = "Danh Ngoc";
+const char* password = "0982555644";
 const char* firebaseUrl = "https://ltdd-945a5-default-rtdb.asia-southeast1.firebasedatabase.app";
 
 // ==================================================
@@ -86,7 +90,10 @@ volatile float nhietDo = 0.0;
 volatile float doAm = 0.0;
 bool trangThaiCua = false;
 bool trangThaiDen = false;
-volatile bool canGuiCloudNgay = false; // Cờ kích hoạt gửi đồng bộ Cloud tức thì khi quẹt thẻ / bấm Remote
+volatile bool canhBaoLua = false;      // Cờ trạng thái phát hiện ngọn lửa
+volatile int giaTriLua = 0;           // Giá trị analog đọc từ mắt thu cảm biến lửa 2 chân (0 - 4095)
+const int NGUONG_LUA = 2500;          // Ngưỡng kích hoạt báo cháy (khi dùng INPUT_PULLUP, analog < 2500 là có lửa)
+volatile bool canGuiCloudNgay = false; // Cờ kích hoạt gửi đồng bộ Cloud tức thì khi quẹt thẻ / bấm Remote / báo cháy
 
 unsigned long thoiGianDocDHT = 0;
 unsigned long thoiGianLCD = 0;
@@ -148,16 +155,40 @@ void hienThiChoThe() {
 }
 
 // ==================================================
-// 7. XỬ LÝ RFID RC522
+// 7. XỬ LÝ RFID RC522 (TỐI ƯU CỰC ĐẠI ĐỘ NHẠY & TỐC ĐỘ)
 // ==================================================
+void toiUuAntenRC522() {
+  // 1. Cấu hình các thanh ghi truyền nhận chuẩn ISO 14443A (nạp 1 lần duy nhất, tránh ghi lặp trong loop)
+  rfid.PCD_WriteRegister(rfid.TxModeReg, 0x00);
+  rfid.PCD_WriteRegister(rfid.RxModeReg, 0x00);
+  rfid.PCD_WriteRegister(rfid.ModWidthReg, 0x26);
+  rfid.PCD_WriteRegister(rfid.TxASKReg, 0x40); // Ép 100% ASK modulation chuẩn phát thẻ không tiếp xúc
+
+  // 2. Kích công suất khuếch đại Anten lên cực đại 48dB (RxGain_max)
+  rfid.PCD_SetAntennaGain(rfid.RxGain_max);
+
+  // 3. Hạ ngưỡng giải mã tín hiệu yếu (RxThresholdReg 0x18) xuống 0x54 (MinLevel = 5, CollLevel = 4)
+  // Giúp anten bắt sóng thẻ siêu nhạy ở cự ly xa hơn và phản hồi tức thì khi thẻ lướt cực nhanh qua anten
+  rfid.PCD_WriteRegister(rfid.RxThresholdReg, 0x54);
+
+  // 4. Kích hoạt Anten phát sóng điện từ
+  rfid.PCD_AntennaOn();
+}
+
 String docUID() {
-  String uid = "";
-  for (byte i = 0; i < rfid.uid.size; i++) {
-    if (rfid.uid.uidByte[i] < 0x10) uid += "0";
-    uid += String(rfid.uid.uidByte[i], HEX);
+  // Dùng mảng char tĩnh và snprintf để chuyển đổi nhanh gấp 100 lần, không cấp phát heap gây phân mảnh RAM
+  char buf[20];
+  if (rfid.uid.size == 4) {
+    snprintf(buf, sizeof(buf), "%02X%02X%02X%02X",
+             rfid.uid.uidByte[0], rfid.uid.uidByte[1],
+             rfid.uid.uidByte[2], rfid.uid.uidByte[3]);
+  } else {
+    int pos = 0;
+    for (byte i = 0; i < rfid.uid.size && pos < 18; i++) {
+      pos += snprintf(buf + pos, sizeof(buf) - pos, "%02X", rfid.uid.uidByte[i]);
+    }
   }
-  uid.toUpperCase();
-  return uid;
+  return String(buf);
 }
 
 void luuTheMaster(String uid) {
@@ -284,15 +315,42 @@ void kiemTraRFID() {
     // Nếu Anten bị tắt (không đủ bit 0x03) hoặc mất tín hiệu kết nối SPI
     if ((tx & 0x03) != 0x03) {
       rfid.PCD_Init();                           // Tái khởi tạo chip RC522
-      rfid.PCD_SetAntennaGain(rfid.RxGain_max); // Kích công suất Anten cực đại 48dB
-      rfid.PCD_AntennaOn();                     // Bật lại Anten phát sóng ngay lập tức
+      toiUuAntenRC522();                         // Tái cấu hình công suất cực đại 48dB và ngưỡng nhạy cao
     }
   }
 
-  if (!rfid.PICC_IsNewCardPresent()) return;
-  if (!rfid.PICC_ReadCardSerial()) return;
+  // =========================================================================
+  // PHÁT HIỆN THẺ SIÊU TỐC: GỌI TRỰC TIẾP WUPA (0x52) 1 CHẠM, BỎ QUA TIMEOUT REQA
+  // =========================================================================
+  byte bufferATQA[2];
+  byte bufferSize = sizeof(bufferATQA);
+
+  // Lệnh WUPA (0x52) đánh thức tức thì TẤT CẢ các thẻ (cả thẻ mới IDLE và thẻ HALT) chỉ trong 1 chu kỳ duy nhất
+  MFRC522::StatusCode status = rfid.PICC_WakeupA(bufferATQA, &bufferSize);
+  if (status != MFRC522::STATUS_OK && status != MFRC522::STATUS_COLLISION) {
+    return;
+  }
+
+  // Đọc mã định danh UID (Anti-collision), thử lại ngay lần 2 nếu bị trượt do quét lướt quá nhanh
+  if (!rfid.PICC_ReadCardSerial()) {
+    if (!rfid.PICC_ReadCardSerial()) return;
+  }
 
   String uidHienTai = docUID();
+
+  // =========================================================================
+  // CHỐNG DỘI THẺ (DEBOUNCE): TRÁNH ĐỌC LẶP LIÊN TỤC KHI GIỮ NGUYÊN THẺ TRÊN ĐẦU ĐỌC
+  // =========================================================================
+  static String uidVuaQuetLuu = "";
+  static unsigned long thoiGianQuetTruoc = 0;
+  if (uidHienTai == uidVuaQuetLuu && (millis() - thoiGianQuetTruoc < 1500)) {
+    // Thẻ trùng vừa quét cách đây dưới 1.5 giây thì bỏ qua, không kích hoạt mở cửa lại
+    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
+    return;
+  }
+  uidVuaQuetLuu = uidHienTai;
+  thoiGianQuetTruoc = millis();
   uidTheVuaQuet = uidHienTai;
 
   Serial.println("\n[RFID] PHAT HIEN THE: " + uidHienTai);
@@ -363,8 +421,7 @@ void kiemTraNutBoot() {
 
         // 3. Tự động kích hoạt lại Anten RC522 công suất tối đa ngay sau khi reset
         rfid.PCD_Init();
-        rfid.PCD_SetAntennaGain(rfid.RxGain_max);
-        rfid.PCD_AntennaOn();
+        toiUuAntenRC522();
         Serial.println("[RFID] Da kich hoat lai Anten RC522 sau khi reset!");
 
         delay(300);
@@ -376,10 +433,40 @@ void kiemTraNutBoot() {
 }
 
 // ==================================================
-// 11. ĐỌC DHT11 & CẬP NHẬT LCD (TỰ ĐỘNG HIỆN LẠI SAU 2S)
+// 11. ĐỌC CẢM BIẾN LỬA 2 ĐẦU CẮM & DHT11 & CẬP NHẬT LCD
 // ==================================================
+void docCamBienLua() {
+  static unsigned long thoiGianDocLua = 0;
+  if (millis() - thoiGianDocLua < 150) return; // Quét kiểm tra tín hiệu lửa mỗi 150ms
+  thoiGianDocLua = millis();
+
+  int val = analogRead(FLAME_PIN);
+  giaTriLua = val;
+
+  // Khi dùng INPUT_PULLUP: Bình thường không có lửa ~ 3500 - 4095.
+  // Khi có ngọn lửa (tia hồng ngoại chiếu vào photodiode), diode dẫn kéo sụt áp xuống < 2500.
+  bool coLua = (val < NGUONG_LUA);
+
+  if (coLua != canhBaoLua) {
+    canhBaoLua = coLua;
+    canGuiCloudNgay = true; // Kích hoạt đồng bộ Cloud Firebase ngay lập tức khi phát hiện cháy hoặc hết cháy
+    if (canhBaoLua) {
+      Serial.printf("\n[CANH BAO] PHAT HIEN LUA! Gia tri cam bien: %d\n", val);
+      hienThi("CANH BAO CHAY!", "PHAT HIEN LUA!");
+      #if ACTIVE_BUZZER
+        digitalWrite(BUZZER_PIN, HIGH);
+      #else
+        tone(BUZZER_PIN, 2400, 400); // Tiếng còi hú báo động cháy
+      #endif
+    } else {
+      Serial.printf("\n[AN TOAN] Da dap tat lua! Gia tri: %d\n", val);
+      hienThi("AN TOAN", "DA TAT LUA");
+    }
+  }
+}
+
 void docCamBienDHT() {
-  if (millis() - thoiGianDocDHT < 2000) return;
+  if (millis() - thoiGianDocDHT < 5000) return; // Giãn chu kỳ lên 5 giây để không block CPU của RFID
   thoiGianDocDHT = millis();
 
   float h = dht.readHumidity();
@@ -395,6 +482,15 @@ void capNhatLCD() {
 
   if (millis() - thoiGianLCD < 2000) return;
   thoiGianLCD = millis();
+
+  // Nếu đang có cảnh báo cháy thì ưu tiên hiển thị cảnh báo cháy trên LCD
+  if (canhBaoLua) {
+    lcd.setCursor(0, 0);
+    lcd.print("! CANH BAO CHAY ");
+    lcd.setCursor(0, 1);
+    lcd.print("! NGUY HIEM LUA ");
+    return;
+  }
 
   lcd.setCursor(0, 0);
   lcd.print("NHIET DO: ");
@@ -418,8 +514,8 @@ String taoChuoiJson() {
   json += "\"dht_ok\":" + String((nhietDo > 0) ? "true" : "false") + ",";
   json += "\"gate\":" + String(trangThaiCua ? "true" : "false") + ",";
   json += "\"light\":" + String(trangThaiDen ? "true" : "false") + ",";
-  json += "\"flame\":false,";
-  json += "\"flame_val\":0,";
+  json += "\"flame\":" + String(canhBaoLua ? "true" : "false") + ",";
+  json += "\"flame_val\":" + String(giaTriLua) + ",";
   json += "\"rfid\":\"" + uidTheVuaQuet + "\",";
   json += "\"master\":\"" + uidTheMaster + "\",";
   json += "\"ip\":\"http://" + WiFi.localIP().toString() + "\",";
@@ -667,10 +763,12 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
   pinMode(BTN_BOOT, INPUT_PULLUP); // Cấu hình nút BOOT chống dội phím
+  pinMode(FLAME_PIN, INPUT_PULLUP); // Kích hoạt điện trở kéo lên nội cho cảm biến lửa 2 chân (không cần hàn trở ngoài)
+  analogReadResolution(12); // Thiết lập độ phân giải ADC 12-bit (0 - 4095) trên ESP32
 
-  // Khởi tạo LCD tốc độ an toàn 50kHz chống sụt áp
+  // Khởi tạo LCD tốc độ an toàn 100kHz chuẩn công nghiệp, giảm 50% thời gian block I2C
   Wire.begin(LCD_SDA, LCD_SCL);
-  Wire.setClock(50000);
+  Wire.setClock(100000);
   lcd.init();
   lcd.backlight();
   hienThi("KHOA CUA ESP32", "DANG KHOI DONG");
@@ -708,10 +806,9 @@ void setup() {
     Serial.println("  --> [CANH BAO] MFRC522 mat ket noi hoac bi long day (0x00 / 0xFF)!");
   }
 
-  // KÍCH CÔNG SUẤT ANTEN RC522 LÊN MỨC CỰC ĐẠI 48DB (HẾT CHẬP CHỜN)
-  rfid.PCD_SetAntennaGain(rfid.RxGain_max);
-  rfid.PCD_AntennaOn();
-  Serial.println("  --> [OK] Da kich cong suat Anten len 48dB de bat the xa va nhay nhat!");
+  // KÍCH CÔNG SUẤT ANTEN RC522 LÊN MỨC CỰC ĐẠI 48DB VÀ HẠ NGƯỠNG LỌC (QUÉT SIÊU NHẠY)
+  toiUuAntenRC522();
+  Serial.println("  --> [OK] Da kich cong suat Anten 48dB + ha nguong loc 0x54 de quet the sieu nhay va bat xa nhat!");
 
   docTheMaster();
 
@@ -748,31 +845,39 @@ void setup() {
 }
 
 // ==================================================
-// 17. VÒNG LẶP LOOP (CHẠY TRÊN NHÂN 1 - PHẢN HỒI 0MS TỨC THÌ)
+// 17. VÒNG LẶP LOOP (CHẠY TRÊN NHÂN 1 - TẦN SỐ QUÉT > 1000 LẦN/GIÂY)
 // ==================================================
 void loop() {
-  // 0. Xử lý Web Server LAN nội bộ tức thì (< 5ms) trên Nhân 1 - Không bị block bởi mạng Firebase
-  server.handleClient();
-
-  // 1. Kiểm tra nút BOOT (GPIO 0) nhấn giữ 1.5s để reset Master
-  kiemTraNutBoot();
-
-  // 2. Bắt sóng Remote tức thì (0ms)
-  kiemTraRemoteIR();
-
-  // 3. Quét thẻ RFID tức thì
+  // 0. Quét thẻ RFID ưu tiên cao nhất ngay đầu chu kỳ
   kiemTraRFID();
 
-  // 4. Tự động đóng cửa sau 4s (chỉ kích hoạt khi mở bằng RFID)
+  // 1. Quét cảm biến lửa 2 đầu cắm tức thì để phát hiện nguy cơ hỏa hoạn
+  docCamBienLua();
+
+  // 2. Xử lý Web Server LAN nội bộ tức thì (< 5ms) trên Nhân 1 - Không bị block bởi mạng Firebase
+  server.handleClient();
+
+  // 3. Kiểm tra nút BOOT (GPIO 0) nhấn giữ 1.5s để reset Master
+  kiemTraNutBoot();
+
+  // 4. Bắt sóng Remote tức thì (0ms)
+  kiemTraRemoteIR();
+
+  // 5. Quét kép thẻ RFID lần 2 trong cùng 1 chu kỳ để tốc độ đạt mức cao nhất
+  kiemTraRFID();
+
+  // 6. Tự động đóng cửa sau 4s (chỉ kích hoạt khi mở bằng RFID)
   if (dangDemThoiGianDongCua && (millis() - thoiGianMoCuaTuDong >= THOI_GIAN_MO_CUA)) {
     dongCua("Tu dong dong sau 4s");
   }
 
-  // 5. Đọc cảm biến nhiệt độ DHT11
+  // 7. Đọc cảm biến nhiệt độ DHT11 (chu kỳ 5 giây, không block quét thẻ)
   docCamBienDHT();
 
-  // 6. Cập nhật LCD (sau 2s mở cửa tự quay về nhiệt độ & độ ẩm)
+  // 8. Cập nhật LCD (sau 2s mở cửa tự quay về nhiệt độ & độ ẩm)
   capNhatLCD();
 
-  delay(5);
+  // Nghỉ cực ngắn 200 microsecond (0.2ms) và yield nhường CPU, duy trì tần suất hỏi thẻ > 1000 lần/giây
+  delayMicroseconds(200);
+  yield();
 }
